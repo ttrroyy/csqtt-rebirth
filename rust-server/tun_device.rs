@@ -30,6 +30,12 @@ const FLOW_EVICT_EVERY: u32 = 1024;
 const FLOW_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 const SMALL_UDP_MAX_LEN: usize = 300;
 const SMALL_UDP_STICKY: std::time::Duration = std::time::Duration::from_secs(1);
+// The small-UDP pin holds a flow on ONE stream, and VK caps each allocation at about one stream's
+// rate (~2 Mbit/s): a pinned QUIC download or nested tunnel fell from 20 to 2.1 Mbit/s. A flow keeps its pin
+// only while it fits in one stream (3/4 of TB_RATE); above that it is bulk for BULK_HOLD and rotates in bursts.
+const PIN_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+const PIN_WINDOW_MAX_BYTES: usize = (TB_RATE_BYTES_PER_SEC as usize) * 3 / 4 / 4;
+const BULK_HOLD: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum FlowKey {
@@ -55,6 +61,9 @@ struct FlowState {
     last_seen: std::time::Instant,
     burst_left: usize,
     sticky_until: Option<std::time::Instant>,
+    window_start: std::time::Instant,
+    window_bytes: usize,
+    bulk_until: Option<std::time::Instant>,
 }
 
 fn transport_ports(packet: &[u8], offset: usize, proto: u8) -> (u16, u16) {
@@ -274,7 +283,17 @@ impl ClientRoute {
 
         if let Some(mut state) = self.flows.get(&key).copied() {
             state.last_seen = now;
-            if small_udp {
+            if now.saturating_duration_since(state.window_start) >= PIN_WINDOW {
+                state.window_start = now;
+                state.window_bytes = 0;
+            }
+            state.window_bytes += packet.len();
+            if state.window_bytes > PIN_WINDOW_MAX_BYTES {
+                state.bulk_until = Some(now + BULK_HOLD);
+                state.sticky_until = None;
+            }
+            let bulk = state.bulk_until.is_some_and(|until| now < until);
+            if small_udp && !bulk {
                 state.sticky_until = Some(now + SMALL_UDP_STICKY);
             }
             let sticky = state.sticky_until.is_some_and(|until| now < until);
@@ -305,6 +324,9 @@ impl ClientRoute {
                 last_seen: now,
                 burst_left: FLOW_BURST_BYTES.saturating_sub(packet.len()),
                 sticky_until: small_udp.then(|| now + SMALL_UDP_STICKY),
+                window_start: now,
+                window_bytes: packet.len(),
+                bulk_until: None,
             },
         );
         self.tokens[idx] = (self.tokens[idx] - len_f).max(MAX_DEFICIT);
@@ -626,6 +648,42 @@ mod tests {
                 None => pinned = Some(ep.worker_id),
             }
         }
+    }
+
+    #[test]
+    fn downlink_bulk_udp_with_small_packets_is_not_pinned() {
+        // A QUIC-like download (1300-byte packets at ~20 Mbit/s, a small one every 200 ms) must spread.
+        let mut table = RouteTable::new();
+        for w in 1..=10u16 {
+            assert!(table.register(ip(2), w as _, w as _, w as _, w as _));
+        }
+        let start = std::time::Instant::now();
+        let (big, small) = (udp_packet(1300, 443), udp_packet(100, 443));
+        let mut per = std::collections::HashMap::new();
+        for i in 0..4000u64 {
+            let now = start + std::time::Duration::from_micros(i * 520);
+            let pkt = if i % 385 == 0 { &small } else { &big };
+            *per.entry(table.select_packet(2, now, pkt).unwrap().worker_id).or_insert(0usize) += 1;
+        }
+        let top = per.values().copied().max().unwrap();
+        assert!(per.len() == 10 && top < 4000 / 5, "a bulk flow must use every stream: {per:?}");
+    }
+
+    #[test]
+    fn downlink_game_flow_with_large_packets_stays_pinned() {
+        // The Steam fix stands for a flow that fits one stream (64 pkt/s, small and 1200-byte mixed).
+        let mut table = RouteTable::new();
+        for w in 1..=3u16 {
+            assert!(table.register(ip(2), w as _, w as _, w as _, w as _));
+        }
+        let start = std::time::Instant::now();
+        let (big, small) = (udp_packet(1200, 27015), udp_packet(120, 27015));
+        let mut ids = Vec::new();
+        for i in 0..320u64 {
+            let now = start + std::time::Duration::from_micros(i * 15_625);
+            ids.push(table.select_packet(2, now, if i % 2 == 0 { &small } else { &big }).unwrap().worker_id);
+        }
+        assert!(ids.iter().all(|&w| w == ids[0]), "a game flow must keep one stream: {ids:?}");
     }
 
     #[test]
