@@ -12,15 +12,9 @@ class CsqttApplication : Application() {
         super.onCreate()
         DeployManager.init(this)
 
-        CoroutineScope(SupervisorJob() + Dispatchers.Main).launch {
-            try {
-                TunnelManager.running.collect {
-                    VpnWidgetProvider.updateAllWidgets(this@CsqttApplication)
-                }
-            } catch (e: Exception) {
-                Log.e("CsqttApp", "Не удалось обновить виджеты: ${e.message}")
-            }
-        }
+        // The QS tile and the widgets follow the tunnel from process start, not from MainActivity:
+        // a tile or widget tap starts the process too, and the tile is refreshed only on request.
+        TunnelManager.initObservers(this)
 
         val settingsStore = SettingsStore(this)
         CoroutineScope(SupervisorJob() + Dispatchers.Main).launch {
